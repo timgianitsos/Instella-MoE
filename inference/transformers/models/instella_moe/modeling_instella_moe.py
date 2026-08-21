@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 """
-Modular Instella-MoE for transformers 4.57.1.
+Modular Instella-MoE for transformers 4.57 - 5.15.
 
 This file imports the numerically-unchanged building blocks from the installed
 `transformers.models.deepseek_v3` package and defines ONLY the classes that carry
@@ -16,8 +16,15 @@ a FarSkip or gated-attention delta:
   * FarSkipDecoderLayer - tuple-residual (residual, residual_no_routed) dataflow
   * FarSkipMoE        - returns (routed, shared) separately (FarSkip needs both)
   * MLAGatedAttention  - adds sigmoid `gate_proj` before `o_proj`
+
+Everything upstream changed between 4.57 and 5.15 is resolved once in
+`_transformers_compat.py` and imported here under a stable name, so there are no version
+checks below.
 """
 
+from collections.abc import Callable
+# `X | None` annotations are what 5.x uses, but 4.57's `auto_docstring` inspects them with
+# `annotation.__name__`, which a `types.UnionType` does not have. `Optional` works on both.
 from typing import Optional, Union
 
 import torch
@@ -25,13 +32,11 @@ from torch import nn
 
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
-from transformers.utils.generic import check_model_inputs
 
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3RMSNorm,
@@ -42,14 +47,61 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3Attention,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_interleave,
-    eager_attention_forward,
 )
 
+from ._transformers_compat import (
+    FUSED_EXPERT_CLASSES,
+    HAS_LATENT_KV_CACHE,
+    KEEP_IN_FP32_MODULES_STRICT,
+    TP_PLAN_COLWISE_GATHER,
+    build_causal_mask,
+    get_attention_interface,
+    model_forward_decorator,
+    normal_,
+    register_conversion_mapping,
+    routed_expert_output,
+    zeros_,
+)
 from .configuration_instella_moe import InstellaMoEConfig
+
+register_conversion_mapping()
+
+
+def _kv_and_cache_materialized(self, kv_latent, k_rot, cos, sin, past_key_values, cache_position):
+    """Expand the latent to full K/V first, then cache the materialized tensors (4.57 - 5.14)."""
+    batch_size, _, seq_length, _ = k_rot.shape
+    key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
+
+    k_pass = self.kv_b_proj(kv_latent).view(key_shape).transpose(1, 2)
+    k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+    key_states = torch.cat((k_pass, k_rot.expand(*k_pass.shape[:-1], -1)), dim=-1)
+
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_values.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
+        )
+    return key_states, value_states
+
+
+def _kv_and_cache_latent(self, kv_latent, k_rot, cos, sin, past_key_values, cache_position):
+    """Cache the compressed latent and reconstruct K/V from it after the read (5.15+)."""
+    batch_size, _, seq_length, _ = k_rot.shape
+    # Both latents are viewed as single-head, 4D tensors so all cache layers handle them correctly
+    kv_latent = kv_latent.view(batch_size, 1, seq_length, self.kv_lora_rank)
+
+    # Cache read / write is performed while latent KV is still compressed
+    if past_key_values is not None:
+        kv_latent, k_rot = past_key_values.update(kv_latent, k_rot, self.layer_idx)
+
+    return self.expand_kv(kv_latent, k_rot)
 
 
 class MLAGatedAttention(DeepseekV3Attention):
     """DeepSeek-V3 MLA with optional gated attention (attn_output * sigmoid(gate_proj(x)))."""
+
+    # The only place the supported transformers range needs two genuinely different code paths.
+    _kv_and_cache = _kv_and_cache_latent if HAS_LATENT_KV_CACHE else _kv_and_cache_materialized
 
     def __init__(self, config: InstellaMoEConfig, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -70,7 +122,6 @@ class MLAGatedAttention(DeepseekV3Attention):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, seq_length = hidden_states.shape[:-1]
         query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
-        key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
 
         if self.q_lora_rank is None:
             q_states = self.q_proj(hidden_states)
@@ -80,11 +131,8 @@ class MLAGatedAttention(DeepseekV3Attention):
         q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-
-        k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
-        k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
+        kv_latent, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_latent = self.kv_a_layernorm(kv_latent)
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
         cos, sin = position_embeddings
@@ -92,23 +140,13 @@ class MLAGatedAttention(DeepseekV3Attention):
             q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
         else:
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
-        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
         query_states = torch.cat((q_pass, q_rot), dim=-1)
-        key_states = torch.cat((k_pass, k_rot), dim=-1)
+        key_states, value_states = self._kv_and_cache(
+            kv_latent, k_rot, cos, sin, past_key_values, cache_position
+        )
 
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-            value_states = nn.functional.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
-
-        attention_interface = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = get_attention_interface(self.config)
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -120,9 +158,6 @@ class MLAGatedAttention(DeepseekV3Attention):
             scaling=self.scaling,
             **kwargs,
         )
-
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-            attn_output = attn_output[:, :, :, : self.v_head_dim]
 
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
 
@@ -140,9 +175,7 @@ class FarSkipMoE(DeepseekV3MoE):
     def forward(self, hidden_states):
         residuals = hidden_states
         orig_shape = hidden_states.shape
-        topk_indices, topk_weights = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        routed = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+        routed = routed_expert_output(self, hidden_states).view(*orig_shape)
         shared = self.shared_experts(residuals)
         # First element is the full MoE output (routed + shared) so the main residual
         # stream stays numerically identical to stock DeepSeek-V3; `shared` is returned
@@ -251,11 +284,17 @@ class InstellaMoEPreTrainedModel(PreTrainedModel):
         "hidden_states": FarSkipDecoderLayer,
         "attentions": MLAGatedAttention,
     }
+    _keep_in_fp32_modules_strict = KEEP_IN_FP32_MODULES_STRICT
 
+    @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
         if isinstance(module, DeepseekV3TopkRouter):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            normal_(module.weight, self.config.initializer_range)
+            zeros_(module.e_score_correction_bias)
+        elif isinstance(module, FUSED_EXPERT_CLASSES):
+            normal_(module.gate_up_proj, self.config.initializer_range)
+            normal_(module.down_proj, self.config.initializer_range)
 
 
 @auto_docstring
@@ -275,7 +314,7 @@ class InstellaMoEModel(InstellaMoEPreTrainedModel):
 
         self.post_init()
 
-    @check_model_inputs
+    @model_forward_decorator
     @auto_docstring
     def forward(
         self,
@@ -288,6 +327,12 @@ class InstellaMoEModel(InstellaMoEPreTrainedModel):
         use_cache: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length,)`, *optional*):
+            Indices of the input tokens within the full sequence. Documented here because 5.9
+            removed it and `auto_docstring` will complain for any
+            undocumented argument.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -297,6 +342,8 @@ class InstellaMoEModel(InstellaMoEPreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
+        # `cache_position` is still needed for the pre-5.15 materialized KV cache write even
+        # though the 5.9+ mask builder derives it from `position_ids` itself.
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -306,17 +353,17 @@ class InstellaMoEModel(InstellaMoEPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
+        causal_mask = build_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
+            cache_position=cache_position,
         )
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
@@ -324,6 +371,7 @@ class InstellaMoEModel(InstellaMoEPreTrainedModel):
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
+                use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
@@ -340,9 +388,12 @@ class InstellaMoEModel(InstellaMoEPreTrainedModel):
 
 @auto_docstring
 class InstellaMoEForCausalLM(InstellaMoEPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
-    _tp_plan = {"lm_head": "colwise_rep"}
+    # The mapping form is read directly on 5.x; 4.57 iterates it, which yields the keys and so
+    # matches the list of tied-weight patterns it expects.
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tp_plan = {"lm_head": TP_PLAN_COLWISE_GATHER}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _fsdp_plan = {"lm_head": "keep_full_weight"}
 
     def __init__(self, config):
         super().__init__(config)
@@ -367,6 +418,12 @@ class InstellaMoEForCausalLM(InstellaMoEPreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length,)`, *optional*):
+            Indices of the input tokens within the full sequence. Documented here because 5.9
+            removed it and `auto_docstring` will complain for any
+            undocumented argument.
+        """
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

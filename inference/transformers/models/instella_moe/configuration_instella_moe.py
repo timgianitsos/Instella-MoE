@@ -12,52 +12,52 @@ logger = logging.get_logger(__name__)
 DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 class InstellaMoEConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`InstellaMoEModel`]. It is used to instantiate an DeepSeek
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the DeepSeek-V3.
+    This is the configuration class to store the configuration of a [`InstellaMoEModel`]. It is used to instantiate an
+    Instella-MoE model according to the specified arguments, defining the model architecture. Instantiating a
+    configuration with the defaults will yield a similar configuration to that of Instella-MoE-16B-A3B.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 129280):
+        vocab_size (`int`, *optional*, defaults to 128896):
             Vocabulary size of the Deep model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`InstellaMoEModel`]
-        hidden_size (`int`, *optional*, defaults to 4096):
+        hidden_size (`int`, *optional*, defaults to 2048):
             Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 11008):
+        intermediate_size (`int`, *optional*, defaults to 10944):
             Dimension of the MLP representations.
-        moe_intermediate_size (`int`, *optional*, defaults to 1407):
+        moe_intermediate_size (`int`, *optional*, defaults to 1408):
             Dimension of the MoE representations.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
+        num_hidden_layers (`int`, *optional*, defaults to 27):
             Number of hidden layers in the Transformer decoder.
-        num_nextn_predict_layers (`int`, *optional*, defaults to 1):
+        num_nextn_predict_layers (`int`, *optional*, defaults to 0):
             Number of nextn predict layers in the InstellaMoE Model.
-        num_attention_heads (`int`, *optional*, defaults to 32):
+        num_attention_heads (`int`, *optional*, defaults to 16):
             Number of attention heads for each attention layer in the Transformer decoder.
-        n_shared_experts (`int`, *optional*, defaults to None):
+        n_shared_experts (`int`, *optional*, defaults to 2):
             Number of shared experts, None means dense model.
-        n_routed_experts (`int`, *optional*, defaults to None):
+        n_routed_experts (`int`, *optional*, defaults to 64):
             Number of routed experts, None means dense model.
-        routed_scaling_factor (`float`, *optional*, defaults to 1.0):
+        routed_scaling_factor (`float`, *optional*, defaults to 2.5):
             Scaling factor or routed experts.
-        topk_method (`str`, *optional*, defaults to `gready`):
+        topk_method (`str`, *optional*, defaults to `noaux_tc`):
             Topk method used in routed gate.
-        n_group (`int`, *optional*, defaults to None):
+        n_group (`int`, *optional*, defaults to 1):
             Number of groups for routed experts.
-        topk_group (`int`, *optional*, defaults to None):
+        topk_group (`int`, *optional*, defaults to 1):
             Number of selected groups for each token(for each token, ensuring the selected experts is only within `topk_group` groups).
-        num_experts_per_tok (`int`, *optional*, defaults to None):
+        num_experts_per_tok (`int`, *optional*, defaults to 6):
             Number of selected experts, None means dense model.
         moe_layer_freq (`int`, *optional*, defaults to 1):
             The frequency of the MoE layer: one expert layer for every `moe_layer_freq - 1` dense layers.
-        first_k_dense_replace (`int`, *optional*, defaults to 0):
+        first_k_dense_replace (`int`, *optional*, defaults to 1):
             Number of dense layers in shallow layers(embed->dense->dense->...->dense->moe->moe...->lm_head).
                                                             \--k dense layers--/
-        norm_topk_prob (`bool`, *optional*, defaults to False):
+        norm_topk_prob (`bool`, *optional*, defaults to True):
             Whether to normalize the weights of the routed experts.
-        scoring_func (`str`, *optional*, defaults to 'softmax'):
+        scoring_func (`str`, *optional*, defaults to 'sigmoid'):
             Method of computing expert weights.
         aux_loss_alpha (`float`, *optional*, defaults to 0.001):
             Auxiliary loss weight coefficient.
@@ -73,7 +73,7 @@ class InstellaMoEConfig(PretrainedConfig):
             `num_attention_heads`.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
-        max_position_embeddings (`int`, *optional*, defaults to 2048):
+        max_position_embeddings (`int`, *optional*, defaults to 32768):
             The maximum sequence length that this model might ever be used with.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
@@ -84,9 +84,9 @@ class InstellaMoEConfig(PretrainedConfig):
             relevant if `config.is_decoder=True`.
         pad_token_id (`int`, *optional*):
             Padding token id.
-        bos_token_id (`int`, *optional*, defaults to 1):
+        bos_token_id (`int`, *optional*, defaults to 0):
             Beginning of stream token id.
-        eos_token_id (`int`, *optional*, defaults to 2):
+        eos_token_id (`int`, *optional*, defaults to 1):
             End of stream token id.
         pretraining_tp (`int`, *optional*, defaults to 1):
             Experimental feature. Tensor parallelism rank used during pretraining. Please refer to [this
@@ -95,7 +95,7 @@ class InstellaMoEConfig(PretrainedConfig):
             issue](https://github.com/pytorch/pytorch/issues/76232).
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether to tie weight embeddings
-        rope_theta (`float`, *optional*, defaults to 10000.0):
+        rope_theta (`float`, *optional*, defaults to 8000000.0):
             The base period of the RoPE embeddings.
         rope_scaling (`Dict`, *optional*):
             Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
@@ -110,7 +110,7 @@ class InstellaMoEConfig(PretrainedConfig):
     ```python
     >>> from transformers import InstellaMoEModel, InstellaMoEConfig
 
-    >>> # Initializing a Deepseek-V3 style configuration
+    >>> # Initializing an Instella-MoE style configuration
     >>> configuration = InstellaMoEConfig()
 
     >>> # Accessing the model configuration
@@ -120,41 +120,69 @@ class InstellaMoEConfig(PretrainedConfig):
     model_type = "deepseek_v3"
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    # transformers 5.x `DeepseekV3TopkRouter` / `DeepseekV3Experts` read `num_local_experts`.
+    attribute_map = {"num_local_experts": "n_routed_experts"}
+
+    # Fused-expert parameter names only exist on transformers 5.x; these entries match
+    # nothing on 4.x, where the routed experts are separate `DeepseekV3MLP` modules.
+    base_model_tp_plan = {
+        "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
+        "layers.*.mlp.experts.down_proj": "rowwise",
+        "layers.*.mlp.experts": "moe_tp_experts",
+        "layers.*.mlp.shared_experts.gate_proj": "colwise",
+        "layers.*.mlp.shared_experts.up_proj": "colwise",
+        "layers.*.mlp.shared_experts.down_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+    }
+    base_model_pp_plan = {
+        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+        "norm": (["hidden_states"], ["hidden_states"]),
+    }
+    base_model_ep_plan = {
+        "layers.*.mlp.gate": "ep_router",
+        "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+        "layers.*.mlp.experts.down_proj": "grouped_gemm",
+        "layers.*.mlp.experts": "moe_tp_experts",
+    }
+
     def __init__(
         self,
-        vocab_size=129280,
-        hidden_size=7168,
-        intermediate_size=18432,
-        moe_intermediate_size = 2048,
-        num_hidden_layers=61,
-        num_nextn_predict_layers=1,
-        num_attention_heads=128,
-        num_key_value_heads=128,
-        n_shared_experts = 1,
-        n_routed_experts = 256,
+        vocab_size=128896,
+        hidden_size=2048,
+        intermediate_size=10944,
+        moe_intermediate_size = 1408,
+        num_hidden_layers=27,
+        num_nextn_predict_layers=0,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        n_shared_experts = 2,
+        n_routed_experts = 64,
         ep_size = 1,
         routed_scaling_factor = 2.5,
         kv_lora_rank = 512,
         q_lora_rank = None,
-        qk_rope_head_dim = 64,
+        qk_rope_head_dim = 32,
         qk_layernorm = True,
         v_head_dim = 128,
-        qk_nope_head_dim = 128,
+        qk_nope_head_dim = 96,
         qk_head_dim = None,
         rope_interleave = True,
         topk_method = 'noaux_tc',
-        n_group = 8,
-        topk_group = 4,
-        num_experts_per_tok = 8,
+        n_group = 1,
+        topk_group = 1,
+        num_experts_per_tok = 6,
         moe_layer_freq = 1,
-        first_k_dense_replace = 3,
+        first_k_dense_replace = 1,
         gated_attention = True,
         norm_topk_prob = True,
         scoring_func = 'sigmoid',
         aux_loss_alpha = 0.001,
         seq_aux = True,
         hidden_act="silu",
-        max_position_embeddings=4096,
+        max_position_embeddings=32768,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         use_cache=True,
@@ -163,11 +191,11 @@ class InstellaMoEConfig(PretrainedConfig):
         eos_token_id=1,
         pretraining_tp=1,
         tie_word_embeddings=False,
-        rope_theta=10000.0,
+        rope_theta=8000000.0,
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
-        farskip=False,
+        farskip=True,
         tp_split=None,
         farskip_start_idx=0,
         farskip_end_idx=1e4,
@@ -239,5 +267,15 @@ class InstellaMoEConfig(PretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            # 5.0 and 5.1 assemble `rope_parameters` by popping `rope_theta` out of **kwargs and
+            # nowhere else, falling back to the 10000.0 default when it is absent - and declaring
+            # it as a named argument above is exactly what makes it absent. 5.2 added a lookup on
+            # the attribute as well, so passing it back in here is what every other version in the
+            # range already does anyway. Without it 5.0/5.1 load with the wrong rope base and
+            # produce fluent-looking but wrong output, with nothing missing from the load report.
+            rope_theta=rope_theta,
             **kwargs,
         )
+
+
+__all__ = ["InstellaMoEConfig"]
