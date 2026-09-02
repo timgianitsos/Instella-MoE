@@ -5,6 +5,7 @@
   <h1>Instella-MoE✨: Fully Open State-of-the-Art Mixture-of-Experts Language Model</h1>
 <a href='https://huggingface.co/collections/amd/instella-moe'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue'></a>
 <a href='https://rocm.blogs.amd.com/artificial-intelligence/instella-moe/README.html'><img src='https://img.shields.io/badge/Technical-Blog-red'></a> 
+<a href='https://arxiv.org/pdf/2609.00791'><img src='https://img.shields.io/badge/arxiv-2609.00791-blue'></a>
 
 </div>
 
@@ -283,14 +284,14 @@ We release our model collection [here](https://huggingface.co/collections/amd/in
 ## Citations
 
 
-Enjoying our work? Drop us a star ⭐ — it makes our GPUs purr! The Instella-MoE technical report is on its way, but until then, feel free to cite:
+Enjoying our work? Drop us a star ⭐ — it makes our GPUs purr! If you use Instella-MoE, please cite:
 
 ```text
-@article{instella,
-  title={Instella: Fully Open Language Models with Stellar Performance},
-  author={Liu, Jiang and Wu, Jialian and Yu, Xiaodong and Su, Yusheng and Mishra, Prakamya and Ramesh, Gowtham and Ranjan, Sudhanshu and Manem, Chaitanya and Sun, Ximeng and Wang, Ze and Brahma, Pratik Prabhanjan and Liu, Zicheng and Barsoum, Emad},
-  journal={arXiv preprint arXiv:2511.10628},
-  year={2025}
+@article{instella-moe,
+  title={Instella-MoE Technical Report},
+  author={Liu, Jiang and Ranjan, Sudhanshu and Mishra, Prakamya and Dukler, Yonatan and Ramesh, Gowtham and Wu, Jialian and Sun, Ximeng and Xie, Wen and Hou, Chaojun and Appia, Vikram and Gu, Zhenyu and Liu, Zicheng and Barsoum, Emad},
+  journal={arXiv preprint arXiv:2609.00791},
+  year={2026}
 }
 
 @inproceedings{
