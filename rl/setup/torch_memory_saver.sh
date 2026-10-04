@@ -14,9 +14,12 @@ if [ -f "${TMS_SO}" ]; then
     exit 0
 fi
 
+TMS_REPO="${TMS_REPO:-https://github.com/fzyzcjy/torch_memory_saver.git}"
+TMS_COMMIT="${TMS_COMMIT:-d64a639}"
+
 rm -rf "${TMS_DIR}"
-git clone https://github.com/zyzshishui/torch_memory_saver.git "${TMS_DIR}"
-git -C "${TMS_DIR}" checkout -b rocm origin/rocm
+git clone "${TMS_REPO}" "${TMS_DIR}"
+git -C "${TMS_DIR}" checkout "${TMS_COMMIT}"
 pip install -e "${TMS_DIR}"
 (cd "${TMS_DIR}" && python3 setup.py build_ext --inplace)
 
