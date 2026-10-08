@@ -125,7 +125,18 @@ class InstellaMoEConfig(PretrainedConfig):
 
     # Fused-expert parameter names only exist on transformers 5.x; these entries match
     # nothing on 4.x, where the routed experts are separate `DeepseekV3MLP` modules.
+    #
+    # Attention is sharded by head, mirroring transformers' DeepSeek-V2 plan, so `tp_plan="auto"`
+    # no longer computes every attention head redundantly on each rank. `gate_proj` is
+    # head-major like the attention output it multiplies; `kv_a_proj_with_mqa` stays replicated.
+    # Requires tp_size to divide num_attention_heads, and transformers with "mla_kv_a_proj" (>= 5.12).
+    # UNTESTED: not yet validated on GPUs. Compare tp_plan="auto" logits against a single-GPU run.
     base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.kv_a_proj_with_mqa": "mla_kv_a_proj",
+        "layers.*.self_attn.kv_b_proj": "colwise",
+        "layers.*.self_attn.gate_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
         "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
         "layers.*.mlp.experts.down_proj": "rowwise",
         "layers.*.mlp.experts": "moe_tp_experts",
