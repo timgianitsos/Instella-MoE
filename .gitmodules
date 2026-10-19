@@ -3,4 +3,5 @@
 	url = https://github.com/NVIDIA/Megatron-LM.git
 [submodule "rl/miles"]
 	path = rl/miles
-	url = https://github.com/radixark/miles.git
+	url = https://github.com/timgianitsos/miles.git
+	branch = opd2-backports
