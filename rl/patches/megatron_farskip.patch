@@ -62,6 +62,23 @@ index 461501f97..31a15cf1c 100755
      # Create the layer specs for the model.
      layer_specs = []
      for layer_number in range(config.num_layers):
+diff --git a/megatron/core/transformer/mla_qk_norm_config.py b/megatron/core/transformer/mla_qk_norm_config.py
+index e14066a10..5ee4a3a31 100644
+--- a/megatron/core/transformer/mla_qk_norm_config.py
++++ b/megatron/core/transformer/mla_qk_norm_config.py
+@@ -144,6 +144,12 @@ class QKNormConfigResolver:
+                 linear_q_up_proj_cls = self._non_fused_or_default(
+                     self.submodules.linear_q_up_proj, "linear_q_up_proj"
+                 )
++        elif self.submodules.linear_q_proj is not None and not self._is_fused_norm_linear(
++            self.submodules.linear_q_proj
++        ):
++            # Without Q-LoRA there is no Q latent to normalize (HF DeepSeek-V2 has no Q norm
++            # then): keep the spec's plain projection instead of fusing in an extra norm.
++            linear_q_proj_cls = self.submodules.linear_q_proj
+         else:
+             linear_q_proj_cls = self._mla_fused_linear_or_default(
+                 self.submodules.linear_q_proj, "linear_q_proj"
 diff --git a/megatron/core/transformer/moe/moe_layer.py b/megatron/core/transformer/moe/moe_layer.py
 index c4ad0b793..7deee7266 100644
 --- a/megatron/core/transformer/moe/moe_layer.py
