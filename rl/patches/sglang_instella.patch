@@ -1,0 +1,37 @@
+diff --git a/python/sglang/kernels/ops/attention/decode_attention.py b/python/sglang/kernels/ops/attention/decode_attention.py
+index 8bd69df94e..b30aaafe0b 100644
+--- a/python/sglang/kernels/ops/attention/decode_attention.py
++++ b/python/sglang/kernels/ops/attention/decode_attention.py
+@@ -802,6 +802,10 @@ def _decode_grouped_att_m_fwd(
+     elif Lk == 288:
+         BLOCK_DMODEL = 256
+         BLOCK_DPE = 32
++    elif Lv < Lk and Lv == triton.next_power_of_2(Lv):
++        # Other MLA rope widths, e.g. kv_lora_rank 512 + qk_rope_head_dim 32.
++        BLOCK_DMODEL = Lv
++        BLOCK_DPE = triton.next_power_of_2(Lk - Lv)
+     else:
+         BLOCK_DMODEL = triton.next_power_of_2(Lk)
+         BLOCK_DPE = 0
+@@ -1975,6 +1979,9 @@ def _decode_lean_attention_fwd(
+         BLOCK_DMODEL, BLOCK_DPE = 512, 64
+     elif Lk == 288:
+         BLOCK_DMODEL, BLOCK_DPE = 256, 32
++    elif Lv < Lk and Lv == triton.next_power_of_2(Lv):
++        # Other MLA rope widths, e.g. kv_lora_rank 512 + qk_rope_head_dim 32.
++        BLOCK_DMODEL, BLOCK_DPE = Lv, triton.next_power_of_2(Lk - Lv)
+     else:
+         BLOCK_DMODEL, BLOCK_DPE = triton.next_power_of_2(Lk), 0
+     BLOCK_DV = triton.next_power_of_2(Lv)
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index dea960a19b..3ca865c881 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -1265,6 +1265,7 @@ class ModelConfig:
+             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
+             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
+             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
++            or "InstellaMoEForCausalLM" in self.hf_config.architectures
+             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
+             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
+             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
