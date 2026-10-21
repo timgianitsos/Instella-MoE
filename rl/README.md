@@ -20,6 +20,34 @@ The `training/` (Primus-Instella + Megatron-LM) and `inference/`
 (FarSkip-Collective SGLang) components live at the repository root and are
 referenced by the setup script.
 
+## Setup on current Miles (recommended)
+
+`rl/miles` pins upstream Miles `5078ff7`, the commit in Miles' ROCm image
+`rocm/sgl-dev:miles-rocm724-mi35x-20261020` (which also ships the Megatron-LM and SGLang that
+Miles commit expects). Instella needs only three small patches on top, applied by
+`rl/setup/setup_miles_main.sh` inside that image:
+
+| patch | target | why |
+|---|---|---|
+| `rl/patches/megatron_farskip.patch` | the image's Megatron-LM (`/root/Megatron-LM`) | FarSkip layer (`--use-simple-farskip-layer`), gated MLA (`--gated-attention`); plain `q_proj` for MLA without Q-LoRA |
+| `rl/patches/sglang_instella.patch` | the image's SGLang (`/sgl-workspace/sglang`) | register `InstellaMoEForCausalLM` as MLA; Triton decode for rope width 32 |
+| `rl/patches/miles_instella.patch` | `rl/miles` | `gate_proj` in Miles' DeepSeek-V3 weight sync |
+
+SGLang loads Instella from `rl/sglang_models/instella_sglang` (an external model package,
+`SGLANG_EXTERNAL_MODEL_PACKAGE=instella_sglang` with `rl/sglang_models` on `PYTHONPATH`) instead
+of overlaying `inference/sglang`. Use `--sglang-attention-backend triton` (aiter's MLA kernels
+don't support Instella's head dims). Miles flags for Instella: `--model-name deepseekv3
+--vocab-size 128896` plus `rl/scripts/models/instella-moe.sh`; OPD is
+`--advantage-estimator grpo --use-opd --opd-type sglang`.
+
+```bash
+git submodule update --init rl/miles
+bash rl/setup/setup_miles_main.sh            # inside the Miles ROCm image
+python rl/tests/test_megatron_farskip.py     # optional: FarSkip forward/backward check (torchrun, 1 GPU)
+```
+
+The sections below describe the original setup on the older Miles pin.
+
 ## Setup
 
 From the repository root:
