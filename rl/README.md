@@ -43,7 +43,7 @@ don't support Instella's head dims). Miles flags for Instella: `--model-name dee
 ```bash
 git submodule update --init rl/miles
 bash rl/setup/setup_miles_main.sh            # inside the Miles ROCm image
-python rl/tests/test_megatron_farskip.py     # optional: FarSkip forward/backward check (torchrun, 1 GPU)
+torchrun --nproc-per-node 1 rl/tests/test_megatron_farskip.py   # optional FarSkip check
 ```
 
 The sections below describe the original setup on the older Miles pin.
