@@ -12,3 +12,36 @@ index ef806bda80..b21175cbc7 100644
          elif rest == "self_attention.linear_q_proj.weight":
              return [(f"model.layers.{layer_idx}.self_attn.q_proj.weight", param)]
          elif rest == "self_attention.linear_q_down_proj.weight":
+diff --git a/tools/convert_torch_dist_to_hf.py b/tools/convert_torch_dist_to_hf.py
+index c1fad26835..3bc7b161a0 100644
+--- a/tools/convert_torch_dist_to_hf.py
++++ b/tools/convert_torch_dist_to_hf.py
+@@ -11,6 +11,8 @@ import torch
+ import torch.distributed.checkpoint as dist_cp
+ from typing_extensions import override
+ 
++from megatron.core.dist_checkpointing.serialization import load_common_state_dict
++
+ from miles.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
+ from miles.backends.training_utils.model_companion import ModelCompanionInstallationUtils
+ from miles.utils.hf_utils.config import load_hf_config
+@@ -99,6 +101,8 @@ def get_layer_param(args, name, param):
+ 
+ def get_named_params(args, state_dict):
+     for name, param in state_dict.items():
++        if not torch.is_tensor(param):  # e.g. the checkpoint's "common_state" object
++            continue
+         name = f"module.module.{name}"
+         yield from get_layer_param(args, name, param)
+ 
+@@ -201,7 +205,9 @@ if __name__ == "__main__":
+     state_dict = {}
+     print(f"loading model from {args.input_dir}")
+     t = time.time()
+-    megatron_args = torch.load(os.path.join(args.input_dir, "common.pt"), weights_only=False)["args"]
++    # Common state (incl. the training args) is in common.pt in older torch_dist checkpoints and
++    # inside the checkpoint itself (the "common_state" object) in newer ones.
++    megatron_args = load_common_state_dict(args.input_dir)["args"]
+     if args.origin_hf_dir:
+         megatron_args.hf_checkpoint = args.origin_hf_dir
+     dist_cp.state_dict_loader._load_state_dict(

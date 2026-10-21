@@ -31,7 +31,7 @@ Miles commit expects). Instella needs only three small patches on top, applied b
 |---|---|---|
 | `rl/patches/megatron_farskip.patch` | the image's Megatron-LM (`/root/Megatron-LM`) | FarSkip layer (`--use-simple-farskip-layer`), gated MLA (`--gated-attention`); plain `q_proj` for MLA without Q-LoRA |
 | `rl/patches/sglang_instella.patch` | the image's SGLang (`/sgl-workspace/sglang`) | register `InstellaMoEForCausalLM` as MLA; Triton decode for rope width 32 |
-| `rl/patches/miles_instella.patch` | `rl/miles` | `gate_proj` in Miles' DeepSeek-V3 weight sync |
+| `rl/patches/miles_instella.patch` | `rl/miles` | `gate_proj` in Miles' DeepSeek-V3 weight sync; `tools/convert_torch_dist_to_hf.py` reads checkpoints without `common.pt` (newer Megatron) |
 
 SGLang loads Instella from `rl/sglang_models/instella_sglang` (an external model package,
 `SGLANG_EXTERNAL_MODEL_PACKAGE=instella_sglang` with `rl/sglang_models` on `PYTHONPATH`) instead
@@ -44,6 +44,15 @@ don't support Instella's head dims). Miles flags for Instella: `--model-name dee
 git submodule update --init rl/miles
 bash rl/setup/setup_miles_main.sh            # inside the Miles ROCm image
 torchrun --nproc-per-node 1 rl/tests/test_megatron_farskip.py   # optional FarSkip check
+```
+
+HF -> Megatron: `training/examples/scripts/instella_moe_process_checkpoint/convert_hf_to_megatron.sh`
+(a wrapper around Miles' `tools/convert_hf_to_torch_dist.py`). Megatron -> HF:
+
+```bash
+cd rl/miles && PYTHONPATH=/root/Megatron-LM:$PWD python tools/convert_torch_dist_to_hf.py \
+  --model-name deepseekv3 --vocab-size 128896 --input-dir <ckpt>/iter_N --output-dir <hf_out> \
+  --origin-hf-dir <Instella HF checkpoint>
 ```
 
 The sections below describe the original setup on the older Miles pin.
