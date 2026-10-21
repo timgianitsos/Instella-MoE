@@ -1,0 +1,456 @@
+diff --git a/megatron/core/models/gpt/gpt_layer_specs.py b/megatron/core/models/gpt/gpt_layer_specs.py
+index 461501f97..31a15cf1c 100755
+--- a/megatron/core/models/gpt/gpt_layer_specs.py
++++ b/megatron/core/models/gpt/gpt_layer_specs.py
+@@ -1,5 +1,6 @@
+ # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ import copy
++import dataclasses
+ import warnings
+ from functools import partial
+ from typing import Optional, Union
+@@ -39,6 +40,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
+ from megatron.core.transformer.transformer_layer import (
+     HyperConnectionTransformerLayer,
+     MlpBuilder,
++    SimpleFarSkipTransformerLayer,
+     TransformerLayer,
+     TransformerLayerSubmodules,
+     get_transformer_layer_offset,
+@@ -127,6 +129,7 @@ def get_gpt_layer_with_inference_submodules(
+                     linear_kv_down_proj=backend.linear(),
+                     linear_kv_up_proj=linear_kv_up_proj,
+                     core_attention=backend.core_attention(),
++                    linear_gate_proj=backend.column_parallel_linear(),
+                     linear_proj=backend.row_parallel_linear(),
+                     q_layernorm=IdentityOp,
+                     kv_layernorm=IdentityOp,
+@@ -285,6 +288,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
+                         linear_q_up_proj=linear_q_up_proj,
+                         linear_kv_up_proj=linear_kv_up_proj,
+                         core_attention=backend.core_attention(),
++                        linear_gate_proj=backend.column_parallel_linear(),
+                         linear_proj=backend.row_parallel_linear(),
+                         q_layernorm=IdentityOp,
+                         kv_layernorm=IdentityOp,
+@@ -318,6 +322,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
+                     linear_kv_down_proj=backend.linear(),
+                     linear_kv_up_proj=linear_kv_up_proj,
+                     core_attention=backend.core_attention(),
++                    linear_gate_proj=backend.column_parallel_linear(),
+                     linear_proj=backend.row_parallel_linear(),
+                     q_layernorm=IdentityOp,
+                     kv_layernorm=IdentityOp,
+@@ -453,6 +458,7 @@ def get_gpt_layer_local_submodules(
+                     linear_kv_down_proj=backend.column_parallel_linear(),
+                     linear_kv_up_proj=backend.column_parallel_linear(),
+                     core_attention=backend.core_attention(),
++                    linear_gate_proj=backend.column_parallel_linear(),
+                     linear_proj=backend.row_parallel_linear(),
+                     q_layernorm=qk_norm if qk_layernorm else IdentityOp,
+                     kv_layernorm=qk_norm if qk_layernorm else IdentityOp,
+@@ -696,6 +702,12 @@ def get_gpt_decoder_layer_specs(
+             f"Invalid moe_layer_freq: {type(config.moe_layer_freq)}, {config.moe_layer_freq}"
+         )
+ 
++    if config.use_simple_farskip_layer:
++        dense_layer_spec = dataclasses.replace(
++            dense_layer_spec, module=SimpleFarSkipTransformerLayer
++        )
++        moe_layer_spec = dataclasses.replace(moe_layer_spec, module=SimpleFarSkipTransformerLayer)
++
+     # Create the layer specs for the model.
+     layer_specs = []
+     for layer_number in range(config.num_layers):
+diff --git a/megatron/core/transformer/moe/moe_layer.py b/megatron/core/transformer/moe/moe_layer.py
+index c4ad0b793..7deee7266 100644
+--- a/megatron/core/transformer/moe/moe_layer.py
++++ b/megatron/core/transformer/moe/moe_layer.py
+@@ -684,6 +684,7 @@ class MoELayer(BaseMoELayer):
+         padding_mask: Optional[torch.Tensor] = None,
+         input_ids: Optional[torch.Tensor] = None,
+         packed_seq_params: Optional[PackedSeqParams] = None,
++        return_shared_expert_output: bool = False,
+     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+         """Forward pass for the MoE layer.
+ 
+@@ -700,9 +701,17 @@ class MoELayer(BaseMoELayer):
+                                                    False = valid. Defaults to None.
+             input_ids (torch.Tensor, optional): The input IDs tensor. Shape [seq_length, bsz].
+                                                 Defaults to None.
++            return_shared_expert_output (bool): Also return the shared experts' output on its own
++                (used by SimpleFarSkipTransformerLayer). Defaults to False.
+         Returns:
+-            A tuple containing the output tensor and the MLP bias, if any.
++            A tuple containing the output tensor and the MLP bias, if any, followed by the
++            shared experts' output if return_shared_expert_output.
+         """
++        if return_shared_expert_output:
++            assert intermediate_tensors is None and not self.shared_expert_overlap, (
++                "return_shared_expert_output needs the full forward with shared experts computed "
++                "outside the token dispatcher"
++            )
+         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
+             raise ValueError(
+                 "During training, performance may degrade if MoE and tensor parallelism"
+@@ -795,6 +804,8 @@ class MoELayer(BaseMoELayer):
+                 if intermediate_tensors is not None:
+                     return output
+ 
++            if return_shared_expert_output:
++                return output, mlp_bias, shared_expert_output
+             return output, mlp_bias
+ 
+         if self.moe_layer_recompute and self.training:
+diff --git a/megatron/core/transformer/multi_latent_attention.py b/megatron/core/transformer/multi_latent_attention.py
+index 44a84505e..476e724c5 100644
+--- a/megatron/core/transformer/multi_latent_attention.py
++++ b/megatron/core/transformer/multi_latent_attention.py
+@@ -127,6 +127,7 @@ class MLASelfAttentionSubmodules:
+     linear_kv_up_proj: Union[ModuleSpec, type] = None
+     linear_qkv_down_proj: Union[ModuleSpec, type] = None
+     core_attention: Union[ModuleSpec, type] = None
++    linear_gate_proj: Union[ModuleSpec, type] = None
+ 
+ 
+ class MultiLatentAttention(Attention):
+@@ -227,6 +228,22 @@ class MultiLatentAttention(Attention):
+             **core_attn_extra_kwargs,
+         )
+ 
++        if self.config.gated_attention:
++            # Gated attention: core_attn_out * sigmoid(linear_gate_proj(hidden_states)).
++            self.linear_gate_proj = build_module(
++                submodules.linear_gate_proj,
++                self.config.hidden_size,
++                self.query_projection_size,
++                config=self.config,
++                init_method=self.config.init_method,
++                gather_output=False,
++                bias=False,
++                skip_bias_add=False,
++                is_expert=False,
++                tp_comm_buffer_name='gate_proj',
++                name=(name + ".linear_gate_proj") if name is not None else None,
++            )
++
+         # Output.
+         self.linear_proj = submodules.linear_proj(
+             self.query_projection_size,
+@@ -370,6 +387,9 @@ class MultiLatentAttention(Attention):
+         # Get the query, key and value tensors based on the type of attention -
+         # self or cross attn.
+         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
++        if self.config.gated_attention:
++            gate, _ = apply_module(self.linear_gate_proj)(hidden_states)
++
+         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+         with qkv_linear_manager as hidden_states:
+             query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
+@@ -486,6 +506,9 @@ class MultiLatentAttention(Attention):
+             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
+             self.qkv_up_checkpoint = None
+ 
++        if self.config.gated_attention:
++            core_attn_out = core_attn_out * torch.sigmoid(gate)
++
+         # =================
+         # Output. [sq, b, h]
+         # =================
+diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/transformer/transformer_block.py
+index 7b7495e23..a871d008d 100755
+--- a/megatron/core/transformer/transformer_block.py
++++ b/megatron/core/transformer/transformer_block.py
+@@ -281,6 +281,25 @@ def _get_block_submodules(
+         raise Exception(f"specialize for {type(spec).__name__}.")
+ 
+ 
++def _farskip_kwargs(hidden_states_no_routed: Optional[Tensor]) -> dict:
++    """Layer kwargs carrying the FarSkip stream (see SimpleFarSkipTransformerLayer), if any."""
++    if hidden_states_no_routed is None:
++        return {}
++    return {"hidden_states_no_routed": hidden_states_no_routed}
++
++
++def _unpack_layer_output(layer_output):
++    """Split a layer's output into (hidden_states, context, hidden_states_no_routed).
++
++    Regular layers return (hidden_states, context); SimpleFarSkipTransformerLayer also returns
++    the residual stream without its routed experts' contribution, which feeds the next layer.
++    """
++    if len(layer_output) == 3:
++        return tuple(layer_output)
++    hidden_states, context = layer_output
++    return hidden_states, context, None
++
++
+ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+     """Transformer class."""
+ 
+@@ -644,6 +663,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                 rotary_pos_emb_local,
+                 rotary_pos_emb_global,
+                 padding_mask=None,
++                hidden_states_no_routed=None,
+             ):
+                 rotary_pos_emb = (
+                     (rotary_pos_emb_local, rotary_pos_emb_global)
+@@ -671,7 +691,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                         inner_quantization_context = nullcontext()
+ 
+                     with inner_quantization_context:
+-                        hidden_states, context = layer(
++                        layer_output = layer(
+                             hidden_states=hidden_states,
+                             attention_mask=attention_mask,
+                             context=context,
+@@ -682,16 +702,28 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                             packed_seq_params=packed_seq_params,
+                             padding_mask=padding_mask,
+                             input_ids=input_ids,
++                            **_farskip_kwargs(hidden_states_no_routed),
+                         )
++                    hidden_states, context, hidden_states_no_routed = _unpack_layer_output(
++                        layer_output
++                    )
++                if use_farskip:
++                    return hidden_states, context, hidden_states_no_routed
+                 return hidden_states, context
+ 
+             return custom_forward
+ 
++        # FarSkip layers also pass the residual stream without routed experts to the next layer;
++        # it crosses checkpoint boundaries as an extra input/output tensor.
++        use_farskip = self.config.use_simple_farskip_layer
++        hidden_states_no_routed = hidden_states if use_farskip else None
++
+         def checkpoint_handler(forward_func):
+             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
++            farskip_args = (hidden_states_no_routed,) if use_farskip else ()
+             # TODO: check if fp4 is supported in this case
+             if self.config.fp8 or self.config.fp4:
+-                return te_checkpoint(
++                outputs = te_checkpoint(
+                     forward_func,
+                     self.config.distribute_saved_activations,
+                     tensor_parallel.random.get_cuda_rng_tracker,
+@@ -702,9 +734,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                     context_mask,
+                     *rotary_pos_emb,
+                     padding_mask,
++                    *farskip_args,
+                 )
+             else:
+-                return tensor_parallel.checkpoint(
++                outputs = tensor_parallel.checkpoint(
+                     forward_func,
+                     self.config.distribute_saved_activations,
+                     hidden_states,
+@@ -713,7 +746,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                     context_mask,
+                     *rotary_pos_emb,
+                     padding_mask,
++                    *farskip_args,
+                 )
++            return _unpack_layer_output(outputs)
+ 
+         if self.config.recompute_method == 'uniform':
+             # Uniformly divide the total number of Transformer layers and checkpoint
+@@ -724,7 +759,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                 chunk_end = min(
+                     layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
+                 )
+-                hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
++                hidden_states, context, hidden_states_no_routed = checkpoint_handler(
++                    custom(layer_idx, chunk_end)
++                )
+ 
+                 # Feature extraction for uniform recompute: collect at end of each chunk
+                 # Note: Only the last layer of each chunk can have features collected
+@@ -753,10 +790,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                     layer_idx >= recompute_skip_num_layers
+                     and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                 ):
+-                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
++                    hidden_states, context, hidden_states_no_routed = checkpoint_handler(
++                        custom(layer_idx, layer_idx + 1)
++                    )
+                 else:
+-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
+-                        hidden_states, attention_mask, context, context_mask, *rotary_pos_emb
++                    hidden_states, context, hidden_states_no_routed = _unpack_layer_output(
++                        custom(layer_idx, layer_idx + 1)(
++                            hidden_states,
++                            attention_mask,
++                            context,
++                            context_mask,
++                            *rotary_pos_emb,
++                            padding_mask,
++                            hidden_states_no_routed,
++                        )
+                     )
+ 
+                 # Feature extraction: collect hidden states at specified global layer indices
+@@ -1006,6 +1053,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                     # No intermediate_hidden_states requested: just hidden_states
+                     hidden_states = checkpointed_result
+             else:
++                hidden_states_no_routed = (
++                    hidden_states if self.config.use_simple_farskip_layer else None
++                )
+                 for l_no, layer in enumerate(self.layers):
+                     # Get appropriate inner quantization context
+                     if use_inner_quantization_context:
+@@ -1029,7 +1079,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                         )
+ 
+                     with self.offload_context, inner_quantization_context:
+-                        hidden_states, context = layer(
++                        layer_output = layer(
+                             hidden_states=hidden_states,
+                             attention_mask=attention_mask,
+                             context=context,
+@@ -1045,7 +1095,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
+                             padding_mask=padding_mask,
+                             mhc_recompute_manager=mhc_manager,
+                             input_ids=input_ids,
++                            **_farskip_kwargs(hidden_states_no_routed),
+                         )
++                    hidden_states, context, hidden_states_no_routed = _unpack_layer_output(
++                        layer_output
++                    )
+                     self._finalize_mhc_recompute_layer(
+                         mhc_manager=mhc_manager,
+                         hidden_states=hidden_states,
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index ebbec3913..6057ad120 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -273,6 +273,21 @@ class TransformerConfig(ModelParallelConfig):
+     qk_l2_norm: bool = False
+     """Whether to apply llama 4-style qk L2 norm."""
+ 
++    gated_attention: bool = False
++    """Multiply the attention output by sigmoid(linear_gate_proj(hidden_states)) before the output
++    projection (gated multi-latent attention, as in AMD's FarSkip/Instella models)."""
++
++    use_simple_farskip_layer: bool = False
++    """Use SimpleFarSkipTransformerLayer (FarSkip-Collective): each layer's attention reads the
++    previous layer's output without its routed-expert contribution, and its MLP reads the
++    layer's input instead of the post-attention residual."""
++
++    attn_only_farskip: bool = False
++    """With use_simple_farskip_layer, apply the far skip to attention only."""
++
++    mlp_only_farskip: bool = False
++    """With use_simple_farskip_layer, apply the far skip to the MLP only."""
++
+     qk_clip: bool = False
+     """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
+ 
+diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
+index 5dee791e1..e40f4e98a 100644
+--- a/megatron/core/transformer/transformer_layer.py
++++ b/megatron/core/transformer/transformer_layer.py
+@@ -3164,3 +3164,101 @@ class MoETransformerLayer(TransformerLayer):
+                 input_ids=input_ids,
+                 packed_seq_params=packed_seq_params,
+             )
++
++
++class SimpleFarSkipTransformerLayer(TransformerLayer):
++    """Transformer layer with FarSkip-Collective's far skip connections (no explicit overlap).
++
++    Besides the residual stream ``hidden_states`` (h), the layer takes
++    ``hidden_states_no_routed`` (h'): the previous layer's output without its routed experts'
++    contribution (h' = h for the first layer and after dense layers). With
++    ``r = h + attention(norm(h'))``, it returns ``r + mlp(norm(h))`` and, for the next layer,
++    ``r + shared_experts(norm(h))``. Neither branch then waits for the previous layer's
++    routed-expert all-to-all. ``attn_only_farskip`` feeds the MLP norm(r) instead of norm(h);
++    ``mlp_only_farskip`` feeds attention norm(h) instead of norm(h').
++
++    Returns ``(output, context, hidden_states_no_routed)``; TransformerBlock threads the last
++    element into the next layer. Supports decoder-only stacks without per-layer recompute,
++    offloading, or fused inference kernels.
++    """
++
++    def forward(self, *args, **kwargs):
++        kwargs.pop("dynamic_inference_decode_only", None)
++        kwargs.pop("_called_from_hybrid_mhc_wrapper", None)
++        hidden_states = kwargs.pop("hidden_states") if "hidden_states" in kwargs else args[0]
++        hidden_states_no_routed = kwargs.pop("hidden_states_no_routed", None)
++        if hidden_states_no_routed is None or self.config.mlp_only_farskip:
++            hidden_states_no_routed = hidden_states
++        assert not (
++            self.recompute_input_layernorm or self.recompute_pre_mlp_layernorm or self.recompute_mlp
++        ), "SimpleFarSkipTransformerLayer does not support selective recompute of its modules"
++        assert isinstance(
++            self.cross_attention, (IdentityOp, IdentityFuncOp)
++        ), "SimpleFarSkipTransformerLayer is decoder-only"
++
++        residual = hidden_states.float() if self.config.fp32_residual_connection else hidden_states
++
++        # Attention reads the stream without routed experts; its output joins the full stream.
++        attention_input = apply_module(self.input_layernorm)(hidden_states_no_routed)
++        if isinstance(attention_input, tuple):
++            attention_input = attention_input[0]
++        nvtx_range_push(suffix="self_attention")
++        attention_output, attention_bias = self.self_attention(
++            attention_input,
++            attention_mask=kwargs.get("attention_mask"),
++            inference_context=kwargs.get("inference_context"),
++            rotary_pos_emb=kwargs.get("rotary_pos_emb"),
++            rotary_pos_cos=kwargs.get("rotary_pos_cos"),
++            rotary_pos_sin=kwargs.get("rotary_pos_sin"),
++            rotary_pos_cos_sin=kwargs.get("rotary_pos_cos_sin"),
++            attention_bias=kwargs.get("attention_bias"),
++            packed_seq_params=kwargs.get("packed_seq_params"),
++            sequence_len_offset=kwargs.get("sequence_len_offset"),
++        )
++        nvtx_range_pop(suffix="self_attention")
++        attention_output = self.post_self_attn_layernorm(attention_output)
++        with self.bias_dropout_add_exec_handler():
++            residual_with_attention = self.self_attn_bda(
++                self.training, self.config.bias_dropout_fusion
++            )((attention_output, attention_bias), residual, self.hidden_dropout)
++
++        # The MLP reads the layer input (h), not the post-attention stream.
++        mlp_input = residual_with_attention if self.config.attn_only_farskip else hidden_states
++        mlp_input = apply_module(self.pre_mlp_layernorm)(mlp_input)
++        if isinstance(mlp_input, tuple):
++            mlp_input = mlp_input[0]
++        nvtx_range_push(suffix="mlp")
++        if self.is_moe_layer:
++            mlp_kwargs = {"padding_mask": kwargs.get("padding_mask")}
++            if kwargs.get("input_ids") is not None:
++                mlp_kwargs["input_ids"] = kwargs["input_ids"]
++            if kwargs.get("packed_seq_params") is not None:
++                mlp_kwargs["packed_seq_params"] = kwargs["packed_seq_params"]
++            mlp_output, mlp_bias, shared_expert_output = self.mlp(
++                mlp_input, return_shared_expert_output=True, **mlp_kwargs
++            )
++        else:
++            mlp_output, mlp_bias = apply_module(self.mlp)(mlp_input)
++            shared_expert_output = None
++        nvtx_range_pop(suffix="mlp")
++        mlp_output = self.post_mlp_layernorm(mlp_output)
++
++        with self.bias_dropout_add_exec_handler():
++            bda = self.mlp_bda(self.training, self.config.bias_dropout_fusion)
++            output = bda((mlp_output, mlp_bias), residual_with_attention, self.hidden_dropout)
++            if not self.is_moe_layer:
++                output_no_routed = output
++            elif shared_expert_output is None:
++                output_no_routed = residual_with_attention
++            else:
++                output_no_routed = bda(
++                    (shared_expert_output, None), residual_with_attention, self.hidden_dropout
++                )
++
++        output = make_viewless_tensor(
++            inp=output, requires_grad=output.requires_grad, keep_graph=True
++        )
++        output_no_routed = make_viewless_tensor(
++            inp=output_no_routed, requires_grad=output_no_routed.requires_grad, keep_graph=True
++        )
++        return output, kwargs.get("context"), output_no_routed
