@@ -77,12 +77,19 @@ from megatron.training.training import get_model  # noqa: E402
 
 import miles_plugins.mbridge  # noqa: F401,E402
 from mbridge import AutoBridge  # noqa: E402
+from mbridge.models import DeepseekV3Bridge  # noqa: E402
 from miles.backends.megatron_utils.arguments import set_default_megatron_args  # noqa: E402
 from miles.backends.megatron_utils.initialize import init  # noqa: E402
 from miles.backends.megatron_utils.model_provider import get_model_provider_func  # noqa: E402
 from miles.utils.logging_utils import configure_logger  # noqa: E402
 from miles.utils.memory_utils import print_memory  # noqa: E402
-from miles_plugins.models.hf_attention import _load_hf_config  # noqa: E402
+from miles.utils.hf_utils.config import load_hf_config  # noqa: E402
+
+# Instella's gated attention: Megatron's linear_gate_proj is the HF checkpoint's self_attn.gate_proj.
+DeepseekV3Bridge._ATTENTION_MAPPING = {
+    **DeepseekV3Bridge._ATTENTION_MAPPING,
+    "self_attention.linear_gate_proj.weight": ["model.layers.{layer_number}.self_attn.gate_proj.weight"],
+}
 
 
 def add_conversion_args(parser):
@@ -168,13 +175,6 @@ def get_args():
 
 
 def main():
-    if torch.version.hip:
-        import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
-        from miles.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
-
-        filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
-        print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
-
     configure_logger()
 
     world_size = int(os.getenv("WORLD_SIZE") or os.getenv("SLURM_NTASKS") or 1)
@@ -203,7 +203,7 @@ def main():
         bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
     except (ValueError, KeyError):
         # Fallback for configs whose model_type is unknown to installed transformers.
-        bridge = AutoBridge.from_config(_load_hf_config(hf_model_path))
+        bridge = AutoBridge.from_config(load_hf_config(hf_model_path))
 
     bridge.load_weights(model, hf_model_path, memory_efficient=True)
     print(f"Model loaded: {hf_model_path}")

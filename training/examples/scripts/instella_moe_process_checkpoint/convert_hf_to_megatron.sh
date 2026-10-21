@@ -47,6 +47,11 @@ fi
 
 # megatron.training.* lives in the full Megatron-LM tree (pip megatron-core only
 # ships megatron.core), so point PYTHONPATH at the Megatron-LM submodule.
+# Miles' ROCm image ships the Megatron-LM rl/miles expects (FarSkip-patched by
+# rl/setup/setup_miles_main.sh) at /root/Megatron-LM.
+if [ -z "${MEGATRON_LM_PATH:-}" ] && [ -d /root/Megatron-LM/megatron/training ]; then
+    MEGATRON_LM_PATH=/root/Megatron-LM
+fi
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-${REPO_ROOT}/training/third_party/Megatron-LM}"
 if [ ! -f "${MEGATRON_LM_PATH}/megatron/training/arguments.py" ]; then
     echo "ERROR: megatron.training not found under ${MEGATRON_LM_PATH}" >&2
