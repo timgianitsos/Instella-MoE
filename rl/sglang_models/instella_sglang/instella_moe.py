@@ -14,9 +14,10 @@ Instella-MoE is DeepSeek-V3's MoE with two changes (HF config: ``gated_attention
   layers). With r = h + attention(norm(h')), a layer outputs r + mlp(norm(h)) and
   h' = r + shared_experts(norm(h)).
 
-This is the reference (non-overlapped) FarSkip forward, built from SGLang's DeepSeek-V2 modules.
-It supports one attention/MoE tensor-parallel rank per engine (TP=1, no DP attention or PP),
-which is how Miles runs the Instella student.
+This is FarSkip-Collective's reference implementation (same function as the overlapped one,
+without communication-computation overlap), built from SGLang's DeepSeek-V2 modules. It runs
+single-GPU engines only (TP=1, no DP attention, EP or PP), as opd2 uses them; AMD's original
+SGLang overlay also supported 8-GPU engines (TP/EP=8 with DP attention).
 
     SGLANG_EXTERNAL_MODEL_PACKAGE=instella_sglang PYTHONPATH=<this dir's parent>:...
 """
